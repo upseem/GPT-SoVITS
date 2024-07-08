@@ -120,6 +120,11 @@ RESP: 无
 import argparse
 import os,re
 import sys
+
+now_dir = os.getcwd()
+sys.path.append(now_dir)
+sys.path.append("%s/GPT_SoVITS" % (now_dir))
+
 import signal
 import LangSegment
 from time import time as ttime
@@ -138,7 +143,7 @@ from AR.models.t2s_lightning_module import Text2SemanticLightningModule
 from text import cleaned_text_to_sequence
 from text.cleaner import clean_text
 from module.mel_processing import spectrogram_torch
-from my_utils import load_audio
+from tools.my_utils import load_audio
 import config as global_config
 import logging
 import subprocess
@@ -174,11 +179,12 @@ def change_sovits_weights(sovits_path):
     hps = dict_s2["config"]
     hps = DictToAttrRecursive(hps)
     hps.model.semantic_frame_rate = "25hz"
+    model_params_dict = vars(hps.model)
     vq_model = SynthesizerTrn(
         hps.data.filter_length // 2 + 1,
         hps.train.segment_size // hps.data.hop_length,
         n_speakers=hps.data.n_speakers,
-        **hps.model
+        **model_params_dict
     )
     if ("pretrained" not in sovits_path):
         del vq_model.enc_q
@@ -333,8 +339,46 @@ def pack_audio(audio_bytes, data, rate):
 
 
 def pack_ogg(audio_bytes, data, rate):
-    with sf.SoundFile(audio_bytes, mode='w', samplerate=rate, channels=1, format='ogg') as audio_file:
-        audio_file.write(data)
+    # Author: AkagawaTsurunaki
+    # Issue:
+    #   Stack overflow probabilistically occurs
+    #   when the function `sf_writef_short` of `libsndfile_64bit.dll` is called
+    #   using the Python library `soundfile`
+    # Note:
+    #   This is an issue related to `libsndfile`, not this project itself.
+    #   It happens when you generate a large audio tensor (about 499804 frames in my PC)
+    #   and try to convert it to an ogg file.
+    # Related:
+    #   https://github.com/RVC-Boss/GPT-SoVITS/issues/1199
+    #   https://github.com/libsndfile/libsndfile/issues/1023
+    #   https://github.com/bastibe/python-soundfile/issues/396
+    # Suggestion:
+    #   Or split the whole audio data into smaller audio segment to avoid stack overflow?
+
+    def handle_pack_ogg():
+        with sf.SoundFile(audio_bytes, mode='w', samplerate=rate, channels=1, format='ogg') as audio_file:
+            audio_file.write(data)
+
+    import threading
+    # See: https://docs.python.org/3/library/threading.html
+    # The stack size of this thread is at least 32768
+    # If stack overflow error still occurs, just modify the `stack_size`.
+    # stack_size = n * 4096, where n should be a positive integer.
+    # Here we chose n = 4096.
+    stack_size = 4096 * 4096
+    try:
+        threading.stack_size(stack_size)
+        pack_ogg_thread = threading.Thread(target=handle_pack_ogg)
+        pack_ogg_thread.start()
+        pack_ogg_thread.join()
+    except RuntimeError as e:
+        # If changing the thread stack size is unsupported, a RuntimeError is raised.
+        print("RuntimeError: {}".format(e))
+        print("Changing the thread stack size is unsupported.")
+    except ValueError as e:
+        # If the specified stack size is invalid, a ValueError is raised and the stack size is unmodified.
+        print("ValueError: {}".format(e))
+        print("The specified stack size is invalid.")
 
     return audio_bytes
 
@@ -381,7 +425,7 @@ def read_clean_buffer(audio_bytes):
 
 
 def cut_text(text, punc):
-    punc_list = [p for p in punc if p in {",", ".", ";", "?", "!", "、", "，", "。", "？", "！", ";", "：", "…"}]
+    punc_list = [p for p in punc if p in {",", ".", ";", "?", "!", "、", "，", "。", "？", "！", "；", "：", "…"}]
     if len(punc_list) > 0:
         punds = r"[" + "".join(punc_list) + r"]"
         text = text.strip("\n")
@@ -536,10 +580,6 @@ def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cu
 # --------------------------------
 # 初始化部分
 # --------------------------------
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-sys.path.append("%s/GPT_SoVITS" % (now_dir))
-
 dict_language = {
     "中文": "all_zh",
     "英文": "en",
@@ -579,7 +619,7 @@ parser.add_argument("-hp", "--half_precision", action="store_true", default=Fals
 # 此时 full_precision==True, half_precision==False
 parser.add_argument("-sm", "--stream_mode", type=str, default="close", help="流式返回模式, close / normal / keepalive")
 parser.add_argument("-mt", "--media_type", type=str, default="wav", help="音频编码格式, wav / ogg / aac")
-parser.add_argument("-cp", "--cut_punc", type=str, default="", help="文本切分符号设定, 符号范围,.;?!、，。？！;：…")
+parser.add_argument("-cp", "--cut_punc", type=str, default="", help="文本切分符号设定, 符号范围,.;?!、，。？！；：…")
 # 切割常用分句符为 `python ./api.py -cp ".?!。？！"`
 parser.add_argument("-hb", "--hubert_path", type=str, default=g_config.cnhubert_path, help="覆盖config.cnhubert_path")
 parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, help="覆盖config.bert_path")
